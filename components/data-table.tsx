@@ -52,6 +52,9 @@ import {
   XCircleIcon,
   ClockIcon,
   XIcon,
+  PhoneIcon,
+  MapPinIcon,
+  ImageIcon,
 } from "lucide-react";
 import { Area, AreaChart, CartesianGrid, XAxis } from "recharts";
 import { toast } from "sonner";
@@ -108,6 +111,9 @@ import { useQuery } from "@tanstack/react-query";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { useQueryClient } from "@tanstack/react-query";
 import { AlertDialog } from "@/components/ui/alert-dialog";
+import { spec } from "node:test/reporters";
+import { GoogleMapsScript } from "@/components/google-maps-script";
+import { useGoogleMaps } from "@/components/google-maps-provider";
 
 export const schema = z.object({
   _id: z.string(),
@@ -225,6 +231,20 @@ type Courier = {
   __v: number;
 };
 
+// Add this type definition near your other types
+type LocationDetails = {
+  placeName: string;
+  loading: boolean;
+  error: string | null;
+};
+
+// Add this type declaration for window
+declare global {
+  interface Window {
+    google: typeof google;
+  }
+}
+
 // Create a separate component for the drag handle
 function DragHandle({ id }: { id: string }) {
   const { attributes, listeners } = useSortable({
@@ -286,8 +306,9 @@ const columns: ColumnDef<z.infer<typeof schema>>[] = [
     enableHiding: false,
   },
   {
-    accessorKey: "payment.method",
+    id: "paymentMethod",
     header: "Payment Type",
+    accessorFn: (row) => row.payment.method,
     cell: ({ row }) => (
       <div className="w-32">
         <Badge variant="outline" className="px-1.5 text-muted-foreground">
@@ -768,13 +789,11 @@ export function DataTable() {
             </Select>
             <Select
               value={
-                (table
-                  .getColumn("payment.method")
-                  ?.getFilterValue() as string) ?? "all"
+                (table.getColumn("paymentMethod")?.getFilterValue() as string) ?? "all"
               }
               onValueChange={(value) =>
                 table
-                  .getColumn("payment.method")
+                  .getColumn("paymentMethod")
                   ?.setFilterValue(value === "all" ? "" : value)
               }
             >
@@ -785,9 +804,7 @@ export function DataTable() {
                 <SelectItem value="all">All Methods</SelectItem>
                 <SelectItem value="mobile-money">Mobile Money</SelectItem>
                 <SelectItem value="card">Card</SelectItem>
-                <SelectItem value="cash-on-delivery">
-                  Cash on Delivery
-                </SelectItem>
+                <SelectItem value="cash-on-delivery">Cash on Delivery</SelectItem>
               </SelectContent>
             </Select>
             <Button
@@ -995,11 +1012,106 @@ export function DataTable() {
   );
 }
 
-const chartData = [];
-const chartConfig = {};
-
 function TableCellViewer({ item }: { item: z.infer<typeof schema> }) {
   const isMobile = useIsMobile();
+  const { isLoaded, error: mapsError } = useGoogleMaps();
+  const mapRef = React.useRef<HTMLDivElement>(null);
+  const [mapInstance, setMapInstance] = React.useState<google.maps.Map | null>(null);
+  const [isSheetOpen, setIsSheetOpen] = React.useState(false);
+  const [locationDetails, setLocationDetails] = React.useState<LocationDetails>({
+    placeName: '',
+    loading: false,
+    error: null
+  });
+
+  // Function to initialize Google Maps
+  const initializeMap = React.useCallback(async () => {
+    if (!mapRef.current || !isLoaded || !window.google?.maps) return;
+
+    try {
+      setLocationDetails(prev => ({ ...prev, loading: true, error: null }));
+
+      // Validate coordinates
+      const coordinates = item.deliveryAddress?.coordinates;
+      if (!coordinates || !Array.isArray(coordinates) || coordinates.length !== 2) {
+        throw new Error('Invalid delivery coordinates');
+      }
+
+      // Convert to Google Maps format { lat: latitude, lng: longitude }
+      const position = {
+        lat: Number(coordinates[1]), // latitude is second in the array
+        lng: Number(coordinates[0])  // longitude is first in the array
+      };
+
+      // Validate coordinate values
+      if (isNaN(position.lat) || isNaN(position.lng)) {
+        throw new Error('Invalid coordinate values');
+      }
+
+      // Create new map instance
+      const map = new window.google.maps.Map(mapRef.current, {
+        center: position,
+        zoom: 15,
+        mapTypeControl: false,
+        streetViewControl: false,
+        fullscreenControl: false,
+        zoomControl: true,
+        styles: [
+          {
+            featureType: "poi",
+            elementType: "labels",
+            stylers: [{ visibility: "off" }]
+          }
+        ]
+      });
+
+      // Add marker
+      new window.google.maps.Marker({
+        position,
+        map,
+        title: "Delivery Location",
+        animation: window.google.maps.Animation.DROP
+      });
+
+      setMapInstance(map);
+
+      // Get place name using Geocoding service
+      const geocoder = new window.google.maps.Geocoder();
+      const response = await geocoder.geocode({ location: position });
+      
+      if (response.results[0]) {
+        setLocationDetails({
+          placeName: response.results[0].formatted_address,
+          loading: false,
+          error: null
+        });
+      } else {
+        throw new Error('No results found');
+      }
+    } catch (error) {
+      console.error('Error initializing map:', error);
+      setLocationDetails({
+        placeName: '',
+        loading: false,
+        error: error instanceof Error ? error.message : 'Failed to load location details'
+      });
+    }
+  }, [isLoaded, item.deliveryAddress?.coordinates]);
+
+  // Effect to initialize map when sheet is opened and Maps is loaded
+  React.useEffect(() => {
+    if (isSheetOpen && isLoaded) {
+      initializeMap();
+    }
+  }, [isSheetOpen, isLoaded, initializeMap]);
+
+  // Effect to cleanup map instance when sheet is closed
+  React.useEffect(() => {
+    if (!isSheetOpen && mapInstance) {
+      setMapInstance(null);
+    }
+  }, [isSheetOpen, mapInstance]);
+
   const { data: couriersResponse } = useQuery<{ couriers: Courier[] }>({
     queryKey: ["couriers"],
     queryFn: async () => {
@@ -1025,19 +1137,218 @@ function TableCellViewer({ item }: { item: z.infer<typeof schema> }) {
     return courierObj ? courierObj.user.fullName : "Unknown Courier";
   };
 
+  // Safely get user data
+  const userData = React.useMemo(() => {
+    try {
+      return typeof item.user === 'string' 
+        ? { 
+            id: item.user, 
+            fullName: 'Unknown User', 
+            phoneNumber: 'N/A', 
+            profilePicture: undefined,
+            address: { 
+              street: 'N/A', 
+              region: 'N/A', 
+              country: 'N/A' 
+            } 
+          }
+        : item.user;
+    } catch (error) {
+      return { 
+        id: 'unknown', 
+        fullName: 'Unknown User', 
+        phoneNumber: 'N/A', 
+        profilePicture: undefined,
+        address: { 
+          street: 'N/A', 
+          region: 'N/A', 
+          country: 'N/A' 
+        } 
+      };
+    }
+  }, [item.user]);
+
+  // Function to handle phone call
+  const handlePhoneCall = (phoneNumber: string) => {
+    if (phoneNumber && phoneNumber !== 'N/A') {
+      window.location.href = `tel:${phoneNumber}`;
+    }
+  };
+
   return (
-    <Sheet>
+    <Sheet open={isSheetOpen} onOpenChange={setIsSheetOpen}>
       <SheetTrigger asChild>
         <Button variant="link" className="w-fit px-0 text-left text-foreground">
-          {item._id}
+          <span className="font-medium">#{item._id.slice(0, 8)}</span>
+          <span className="hidden lg:inline ml-2 text-muted-foreground">
+            {item.items.map((item) => item.name).join(", ")}
+            {item.items.length > 1 && ` + ${item.items.length - 1} more`}
+          </span>
         </Button>
       </SheetTrigger>
       <SheetContent side="right" className="flex flex-col">
         <SheetHeader className="gap-1">
-          <SheetTitle>Order Details</SheetTitle>
-          <SheetDescription>Order ID: {item._id}</SheetDescription>
+          <div className="flex flex-col gap-2">
+            <div className="flex items-center gap-3">
+              <Avatar className="h-10 w-10">
+                <AvatarImage src={userData?.profilePicture} />
+                <AvatarFallback>
+                  {userData?.fullName?.split(" ").map((n) => n[0]).join("") || "U"}
+                </AvatarFallback>
+              </Avatar>
+              <div className="flex flex-col">
+                <SheetTitle className="flex items-center gap-2">
+                  {userData?.fullName || "Unknown User"}
+                </SheetTitle>
+                <div className="flex items-center gap-2">
+                  <SheetDescription className="text-xs text-muted-foreground">
+                    {userData?.phoneNumber || "Unknown Phone"}
+                  </SheetDescription>
+                  {userData?.phoneNumber && userData?.phoneNumber !== 'N/A' && (
+                    <Button 
+                      variant="ghost" 
+                      size="icon"
+                      className="h-6 w-6 p-0 hover:bg-muted"
+                      onClick={() => handlePhoneCall(userData.phoneNumber)}
+                    >
+                      <PhoneIcon className="h-3 w-3" />
+                      <span className="sr-only">Call user</span>
+                    </Button>
+                  )}
+                </div>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground pl-12">
+              <span>
+                {userData?.address?.street || 'N/A'}, {userData?.address?.region || 'N/A'}
+              </span>
+              <span className="mx-1">•</span>
+              <span>{userData?.address?.country || 'N/A'}</span>
+            </div>
+          </div>
+          <Separator className="my-3" />
+          <div className="flex flex-col gap-1">
+            <SheetTitle className="text-base">Order Details</SheetTitle>
+            <SheetDescription className="text-xs">
+              <span className="font-medium">Order ID:</span> {item._id}
+            </SheetDescription>
+            {item.specialInstructions !== "NA" && (
+              <div className="text-xs text-muted-foreground">
+                <strong>Special Instructions:</strong> {item.specialInstructions}
+              </div>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <Label htmlFor="payment-status">Payment Status</Label>
+            <Badge variant="outline" className="px-1.5 text-muted-foreground">
+              {item.payment.status}
+            </Badge>
+          </div>
         </SheetHeader>
         <div className="flex flex-1 flex-col gap-4 overflow-y-auto py-4 text-sm">
+          <div className="flex flex-col gap-2">
+            <Label className="font-medium">Products</Label>
+            <div className="rounded-lg border bg-card">
+              <div className="flex flex-col divide-y">
+                {item.items.map((product, index) => (
+                  <div key={index} className="flex items-start gap-3 p-3">
+                    <div className="relative aspect-square h-16 overflow-hidden rounded-md border bg-muted">
+                      {product.imageUrl ? (
+                        <img
+                          src={product.imageUrl}
+                          alt={product.name}
+                          className="absolute inset-0 h-full w-full object-cover"
+                        />
+                      ) : (
+                        <div className="flex h-full w-full items-center justify-center text-muted-foreground">
+                          <ImageIcon className="h-6 w-6" />
+                        </div>
+                      )}
+                    </div>
+                    <div className="flex flex-1 flex-col gap-1">
+                      <div className="flex items-start justify-between gap-2">
+                        <span className="font-medium">{product.name}</span>
+                        <span className="text-right font-medium">
+                          GHS {product.total.toFixed(2)}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <span>Qty: {product.quantity}</span>
+                        <span>•</span>
+                        <span>{product.unitOfMeasure}</span>
+                        {product.discount > 0 && (
+                          <>
+                            <span>•</span>
+                            <Badge variant="secondary" className="px-1 text-xs">
+                              {product.discount}% OFF
+                            </Badge>
+                          </>
+                        )}
+                      </div>
+                      <div className="text-sm text-muted-foreground">
+                        Unit Price: GHS {product.price.toFixed(2)}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="flex flex-col gap-1 border-t bg-muted/50 p-3">
+                <div className="flex items-center justify-between text-sm">
+                  <span className="text-muted-foreground">Subtotal</span>
+                  <span>GHS {item.totalAmount.toFixed(2)}</span>
+                </div>
+                <div className="flex items-center justify-between text-sm">
+                  <span className="text-muted-foreground">Delivery Fee</span>
+                  <span>Calculated at checkout</span>
+                </div>
+                <Separator className="my-2" />
+                <div className="flex items-center justify-between font-medium">
+                  <span>Total</span>
+                  <span>GHS {item.payment.amount.toFixed(2)}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div className="flex flex-col gap-2">
+            <Label className="font-medium">Delivery Location</Label>
+            <div className="rounded-lg border bg-card text-card-foreground shadow-sm">
+              <div 
+                ref={mapRef} 
+                className="h-[200px] w-full rounded-t-lg bg-muted/50"
+                style={{ minHeight: '200px' }}
+              />
+              <div className="flex items-start gap-2 p-3">
+                <MapPinIcon className="mt-1 h-4 w-4 text-muted-foreground shrink-0" />
+                <div className="flex flex-col gap-1 min-h-[2.5rem]">
+                  {locationDetails.loading ? (
+                    <div className="flex items-center gap-2">
+                      <LoaderIcon className="h-4 w-4 animate-spin" />
+                      <span className="text-sm text-muted-foreground">
+                        Loading location details...
+                      </span>
+                    </div>
+                  ) : mapsError ? (
+                    <span className="text-sm text-destructive">
+                      {mapsError}
+                    </span>
+                  ) : locationDetails.error ? (
+                    <span className="text-sm text-destructive">
+                      {locationDetails.error}
+                    </span>
+                  ) : (
+                    <>
+                      <span className="text-sm font-medium">
+                        {locationDetails.placeName}
+                      </span>
+                      <span className="text-xs text-muted-foreground">
+                        Coordinates: {item.deliveryAddress?.coordinates.join(', ')}
+                      </span>
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
           {!isMobile && (
             <>
               <div className="grid gap-2">
